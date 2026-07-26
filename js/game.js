@@ -36,7 +36,7 @@
       this.racers=new Map(); this.local=null; this.ai=[];
       this.running=false; this.ended=false; this.startAt=0; this.lastTs=0; this.elapsed=0;
       this.sendAccumulator=0; this.firstFinishAt=0; this.endlessEndSent=false;
-      this.viewDistance=900; this.keys={}; this.images={cars:[],avatars:[],obstacles:{}};
+      this.viewDistance=1120; this.playerAnchorRatio=.855; this.collisionGap=58; this.keys={}; this.images={cars:[],avatars:[],obstacles:{}};
       this.nitro={active:false,start:0,passDuration:.72,pos:0,pass:0,nextIndex:0,nextEndless:850};
       this.lastFrameRequest=0; this.resizeObserver=null;
       this.boundResize=()=>this.resize();
@@ -65,12 +65,16 @@
 
     makeRacer({id,name,avatar,color,slot,isAI}){
       const diff=Number(this.settings.aiDifficulty||6);
-      return {id,name,avatar:Number(avatar)||1,color:Number(color)||0,slot:Number(slot)||0,isAI,
-        lane:clamp(Number(slot)||0,0,this.lanes-1),targetLane:clamp(Number(slot)||0,0,this.lanes-1),lanePos:clamp(Number(slot)||0,0,this.lanes-1),
-        distance:0,speed:0,targetSpeed:72,score:0,coins:0,finished:false,finishTime:null,
+      const normalizedSlot=Math.max(0,Number(slot)||0);
+      const startLane=normalizedSlot%this.lanes;
+      const startDistance=-Math.floor(normalizedSlot/this.lanes)*72;
+      return {id,name,avatar:Number(avatar)||1,color:Number(color)||0,slot:normalizedSlot,isAI,
+        lane:startLane,targetLane:startLane,lanePos:startLane,
+        distance:startDistance,speed:0,targetSpeed:72,score:0,coins:0,finished:false,finishTime:null,
         invincibleUntil:0,shield:0,ghostUntil:0,magnetUntil:0,jammedUntil:0,boostUntil:0,boostAmount:0,
-        lastHit:0,lastDecision:0,aiReaction:lerp(.78,.18,diff/10)+Math.random()*.18,
-        aiSkill:clamp(diff/10+(Math.random()-.5)*.18,.1,1),collected:new Set(),local:false,displayDistance:0};
+        lastHit:0,lastCarHit:0,lastDecision:0,nextBlockedNotice:0,aiReaction:lerp(.78,.18,diff/10)+Math.random()*.18,
+        aiSkill:clamp(diff/10+(Math.random()-.5)*.18,.1,1),collected:new Set(),local:false,displayDistance:0,
+        netDistance:null,netLanePos:null,netReceivedAt:0};
     }
 
     async load(){
@@ -123,8 +127,21 @@
 
     move(dir){
       if(!this.running||this.ended||Date.now()<this.startAt||this.local.finished)return;
-      if(performance.now()<this.local.jammedUntil)return;
-      this.local.targetLane=clamp(this.local.targetLane+dir,0,this.lanes-1);
+      const now=performance.now();
+      if(now<this.local.jammedUntil)return;
+      // Mỗi lần chỉ chuyển đúng một làn và phải ổn định xe trước khi chuyển tiếp.
+      if(Math.abs(this.local.lanePos-this.local.targetLane)>.08)return;
+      const current=clamp(Math.round(this.local.lanePos),0,this.lanes-1);
+      const candidate=clamp(current+dir,0,this.lanes-1);
+      if(candidate===current)return;
+      // Không cho xe chui xuyên hoặc chồng lên xe đang chiếm làn bên cạnh.
+      if(this.isLaneOccupiedFor(this.local,candidate,62)){
+        this.local.speed*=.94;
+        if(now>=this.local.nextBlockedNotice){this.local.nextBlockedNotice=now+700;this.showGrade('BỊ CHẶN');}
+        return;
+      }
+      this.local.lane=current;
+      this.local.targetLane=candidate;
     }
 
     hitNitro(){
@@ -164,7 +181,7 @@
       if(this.isHost)this.updateAI(dt,ts);
       for(const r of this.racers.values())if(!r.local&&!r.isAI)this.extrapolateRemote(r,dt);
       if(!this.isHost)for(const r of this.ai)this.extrapolateRemote(r,dt);
-      this.checkLocalItems(ts);this.checkRacerCollision(ts);this.updateNitro(ts);
+      this.checkRacerCollision(ts);this.resolveTrafficSpacing(ts);this.checkLocalItems(ts);this.updateNitro(ts);
       this.sendAccumulator+=dt;
       if(this.sendAccumulator>=1/(Number(window.LCR_CONFIG.STATE_SEND_HZ)||10)){
         this.sendAccumulator=0;this.broadcastState();
@@ -179,11 +196,26 @@
 
     updateRacer(r,dt,ts,isAI){
       if(r.finished){r.speed=Math.max(0,r.speed-dt*40);return;}
-      if(ts<r.jammedUntil){};
       const base=this.currentBaseSpeed(r)+(isAI?(r.aiSkill-.5)*9:0);
       const boost=ts<r.boostUntil?r.boostAmount:0;if(ts>=r.boostUntil)r.boostAmount=0;
-      r.targetSpeed=clamp(base+boost,45,175);r.speed=lerp(r.speed||0,r.targetSpeed,clamp(dt*(boost?4.5:2.2),0,1));
-      r.lanePos=lerp(r.lanePos,r.targetLane,clamp(dt*(ts<r.jammedUntil?3.2:8.5),0,1));
+      let desiredSpeed=clamp(base+boost,45,175);
+      // Xe phía sau phải giữ khoảng cách thay vì chạy xuyên vào xe phía trước.
+      const ahead=this.findNearestAhead(r,r.targetLane,185);
+      if(ahead){
+        const gap=ahead.distance-r.distance;
+        const safeGap=this.collisionGap+clamp((r.speed||0)*.06,0,10);
+        if(gap<safeGap*2.25){
+          const followSpeed=Math.max(32,(ahead.speed||55)+(gap-safeGap)*.52);
+          desiredSpeed=Math.min(desiredSpeed,followSpeed);
+        }
+      }
+      r.targetSpeed=desiredSpeed;
+      r.speed=lerp(r.speed||0,r.targetSpeed,clamp(dt*(boost?4.2:2.8),0,1));
+      const delta=r.targetLane-r.lanePos;
+      const laneRate=ts<r.jammedUntil?2.35:3.65;
+      const step=clamp(delta,-laneRate*dt,laneRate*dt);
+      r.lanePos=clamp(r.lanePos+step,0,this.lanes-1);
+      if(Math.abs(r.lanePos-r.targetLane)<.018){r.lanePos=r.targetLane;r.lane=r.targetLane;}
       r.distance+=r.speed*dt;
       if(this.settings.mode==='race'&&r.distance>=this.totalDistance){
         r.distance=this.totalDistance;r.finished=true;r.finishTime=this.elapsed;if(!this.firstFinishAt)this.firstFinishAt=ts;
@@ -191,8 +223,35 @@
       }
     }
 
+    findNearestAhead(r,lane,maxDistance=180){
+      let best=null,bestGap=Infinity;
+      for(const other of this.racers.values()){
+        if(other.id===r.id||other.finished)continue;
+        const occupies=Math.abs(other.lanePos-lane)<.5 || (Math.abs(other.targetLane-lane)<.05&&Math.abs(other.lanePos-lane)<.9);
+        if(!occupies)continue;
+        const gap=other.distance-r.distance;
+        if(gap>0&&gap<bestGap&&gap<maxDistance){best=other;bestGap=gap;}
+      }
+      return best;
+    }
+
+    isLaneOccupiedFor(r,lane,range=60){
+      for(const other of this.racers.values()){
+        if(other.id===r.id||other.finished)continue;
+        const occupies=Math.abs(other.lanePos-lane)<.52 || (Math.abs(other.targetLane-lane)<.05&&Math.abs(other.lanePos-lane)<.92);
+        if(occupies&&Math.abs(other.distance-r.distance)<range)return true;
+      }
+      return false;
+    }
+
     extrapolateRemote(r,dt){
-      if(r.finished)return;r.distance+=(r.speed||0)*dt*.7;r.lanePos=lerp(r.lanePos,r.targetLane,clamp(dt*7,0,1));
+      if(r.finished)return;
+      if(r.netDistance==null){r.distance+=(r.speed||0)*dt*.55;return;}
+      const age=Math.min(.22,(performance.now()-r.netReceivedAt)/1000);
+      const predicted=r.netDistance+(r.speed||0)*age;
+      r.distance=lerp(r.distance,predicted,clamp(dt*10,0,1));
+      r.lanePos=lerp(r.lanePos,r.netLanePos??r.targetLane,clamp(dt*12,0,1));
+      if(Math.abs(r.lanePos-r.targetLane)<.025){r.lanePos=r.targetLane;r.lane=r.targetLane;}
     }
 
     updateAI(dt,ts){
@@ -205,16 +264,28 @@
     }
 
     aiDecide(r,ts){
-      const threats=this.items.concat(this.dynamicItems).filter(i=>i.kind==='obstacle'||i.kind==='oil').filter(i=>i.z>r.distance&&i.z-r.distance<210);
+      if(Math.abs(r.lanePos-r.targetLane)>.08)return;
+      const threats=this.items.concat(this.dynamicItems).filter(i=>i.kind==='obstacle'||i.kind==='oil').filter(i=>i.z>r.distance&&i.z-r.distance<230);
       const laneRisk=Array(this.lanes).fill(0);
-      for(const i of threats){const d=i.z-r.distance;laneRisk[i.lane]+=Math.max(1,230-d);}
-      for(const other of this.racers.values())if(other.id!==r.id){const d=other.distance-r.distance;if(d>0&&d<130)laneRisk[Math.round(other.lanePos)]+=90;}
+      for(const i of threats){const d=i.z-r.distance;laneRisk[i.lane]+=Math.max(1,250-d);}
+      for(const other of this.racers.values())if(other.id!==r.id&&!other.finished){
+        const d=other.distance-r.distance;
+        for(let lane=0;lane<this.lanes;lane++){
+          const occupies=Math.abs(other.lanePos-lane)<.54 || (Math.abs(other.targetLane-lane)<.05&&Math.abs(other.lanePos-lane)<.9);
+          if(!occupies)continue;
+          if(Math.abs(d)<62)laneRisk[lane]+=1200;
+          else if(d>0&&d<165)laneRisk[lane]+=Math.max(80,230-d);
+        }
+      }
       if(Math.random()>.55-r.aiSkill*.3){
         for(const i of this.items){if(i.z>r.distance&&i.z-r.distance<190&&(i.kind==='coin'||i.kind==='power'))laneRisk[i.lane]-=i.kind==='power'?55:22;}
       }
-      const choices=[r.targetLane];if(r.targetLane>0)choices.push(r.targetLane-1);if(r.targetLane<this.lanes-1)choices.push(r.targetLane+1);
-      choices.sort((a,b)=>laneRisk[a]-laneRisk[b]+(Math.random()-.5)*(1-r.aiSkill)*80);
-      if(Math.random()<.08*(1-r.aiSkill))r.targetLane=clamp(r.targetLane+(Math.random()<.5?-1:1),0,this.lanes-1);else r.targetLane=choices[0];
+      const current=clamp(Math.round(r.lanePos),0,this.lanes-1);
+      const choices=[current];if(current>0)choices.push(current-1);if(current<this.lanes-1)choices.push(current+1);
+      choices.sort((a,b)=>laneRisk[a]-laneRisk[b]+(Math.random()-.5)*(1-r.aiSkill)*65);
+      const chosen=choices[0];
+      if(chosen!==current&&!this.isLaneOccupiedFor(r,chosen,64)){r.lane=current;r.targetLane=chosen;}
+      else {r.lane=current;r.targetLane=current;}
     }
 
     aiCollisions(r,ts){
@@ -308,12 +379,35 @@
     }
 
     checkRacerCollision(ts){
-      const r=this.local;if(ts<r.invincibleUntil||ts<r.ghostUntil)return;
+      const r=this.local;if(ts<r.invincibleUntil||ts<r.ghostUntil||ts-r.lastCarHit<700)return;
       for(const other of this.racers.values()){
         if(other.id===r.id||other.finished)continue;
-        if(Math.abs(other.distance-r.distance)<25&&Math.abs(other.lanePos-r.lanePos)<.38){
-          if(r.shield>0){r.shield--;return;}
-          r.speed*=.68;r.invincibleUntil=ts+Number(this.settings.invincibleSeconds||2)*1000;r.score+=10;r.targetLane=clamp(r.targetLane+(r.lanePos<=other.lanePos?-1:1),0,this.lanes-1);return;
+        const longitudinal=Math.abs(other.distance-r.distance);
+        const lateral=Math.abs(other.lanePos-r.lanePos);
+        if(longitudinal<31&&lateral<.48){
+          if(r.shield>0){r.shield--;r.lastCarHit=ts;this.showGrade('SHIELD');return;}
+          r.speed*=.70;r.lastCarHit=ts;r.invincibleUntil=ts+Number(this.settings.invincibleSeconds||2)*1000;
+          // Bị ép làn thì xe quay về tâm làn gần nhất, không xuyên qua thân xe khác.
+          const safeLane=clamp(Math.round(r.lanePos),0,this.lanes-1);r.targetLane=safeLane;r.lane=safeLane;
+          this.showGrade('VA CHẠM');return;
+        }
+      }
+    }
+
+    resolveTrafficSpacing(ts){
+      const racers=[...this.racers.values()].filter(r=>!r.finished);
+      for(let i=0;i<racers.length;i++)for(let j=i+1;j<racers.length;j++){
+        const a=racers[i],b=racers[j];
+        if(Math.abs(a.lanePos-b.lanePos)>=.48)continue;
+        const gap=Math.abs(a.distance-b.distance);
+        if(gap>=this.collisionGap)continue;
+        let front,behind;
+        if(Math.abs(a.distance-b.distance)<.01){front=(a.slot<=b.slot?a:b);behind=front===a?b:a;}
+        else {front=a.distance>b.distance?a:b;behind=front===a?b:a;}
+        const canAdjust=behind.local||(behind.isAI&&this.isHost);
+        if(canAdjust){
+          behind.distance=Math.max(0,front.distance-this.collisionGap);
+          behind.speed=Math.min(behind.speed||0,Math.max(28,(front.speed||50)*.91));
         }
       }
     }
@@ -358,8 +452,12 @@
 
     mergeRemote(s){
       if(!s||s.id===this.local.id)return;let r=this.racers.get(s.id);
+      const isNew=!r;
       if(!r){r=this.makeRacer({id:s.id,name:s.name,avatar:s.avatar,color:s.color,slot:0,isAI:String(s.id).startsWith('AI-')});this.racers.set(r.id,r);}
-      Object.assign(r,{name:s.name,avatar:s.avatar,color:s.color,targetLane:s.targetLane,lane:s.lane,lanePos:s.lanePos,distance:s.distance,speed:s.speed,score:s.score,coins:s.coins,finished:s.finished,finishTime:s.finishTime});
+      Object.assign(r,{name:s.name,avatar:s.avatar,color:s.color,targetLane:clamp(Number(s.targetLane)||0,0,this.lanes-1),lane:clamp(Number(s.lane)||0,0,this.lanes-1),speed:s.speed,score:s.score,coins:s.coins,finished:s.finished,finishTime:s.finishTime});
+      r.netDistance=Number(s.distance)||0;r.netLanePos=clamp(Number(s.lanePos)||0,0,this.lanes-1);r.netReceivedAt=performance.now();
+      if(isNew||Math.abs(r.distance-r.netDistance)>220){r.distance=r.netDistance;r.lanePos=r.netLanePos;}
+      if(s.invincible)r.invincibleUntil=Math.max(r.invincibleUntil,performance.now()+180);
     }
 
     checkEnd(ts){
@@ -397,15 +495,33 @@
       this.hud.effects.innerHTML=effects.map(x=>`<span class="effect-badge">${x}</span>`).join('');
     }
 
+    cameraGeometry(){
+      const horizon=this.height*.305;
+      const roadBottom=this.height*1.015;
+      const playerY=this.height*this.playerAnchorRatio;
+      return {horizon,roadBottom,playerY};
+    }
+
     roadGeometry(y){
-      const horizon=this.height*.18,bottom=this.height*.98,t=clamp((y-horizon)/(bottom-horizon),0,1);const eased=Math.pow(t,1.35);
-      const topW=Math.max(110,this.width*.14),bottomW=Math.min(this.width*.96,105*this.lanes+100);const w=lerp(topW,bottomW,eased);
-      const curve=Math.sin((this.local.distance+y*1.7)/780)*this.width*.035*(1-t);
+      const {horizon,roadBottom}=this.cameraGeometry();
+      const t=clamp((y-horizon)/(roadBottom-horizon),0,1);
+      const eased=Math.pow(t,1.08);
+      const maxRoadW=this.width*(this.width<700?.965:.86);
+      const desiredLaneW=clamp(this.width/(this.lanes+3.0),88,164);
+      const bottomW=Math.min(maxRoadW,desiredLaneW*this.lanes+70);
+      const topW=Math.max(Math.min(this.width*.34,bottomW*.54),Math.min(210,bottomW*.48));
+      const w=lerp(topW,bottomW,eased);
+      // Độ cong rất nhẹ để đường vẫn là cao tốc, không tạo cảm giác dốc lên trời.
+      const curve=Math.sin(this.local.distance/1650+t*1.8)*this.width*.012*(1-t);
       return {left:this.width/2-w/2+curve,width:w,t};
     }
 
     project(relDistance,lane){
-      const horizon=this.height*.18,bottom=this.height*.94;const q=clamp(1-relDistance/this.viewDistance,0,1);const y=horizon+Math.pow(q,1.55)*(bottom-horizon);const g=this.roadGeometry(y);const laneW=g.width/this.lanes;return {x:g.left+(lane+.5)*laneW,y,scale:lerp(.18,1.05,Math.pow(q,1.6)),laneW};
+      const {horizon,playerY}=this.cameraGeometry();
+      const q=clamp(1-relDistance/this.viewDistance,0,1);
+      const y=horizon+Math.pow(q,1.16)*(playerY-horizon);
+      const g=this.roadGeometry(y);const laneW=g.width/this.lanes;
+      return {x:g.left+(lane+.5)*laneW,y,scale:lerp(.16,1.02,Math.pow(q,1.18)),laneW};
     }
 
     render(){
@@ -415,25 +531,43 @@
     }
 
     drawBackground(c,w,h){
-      c.fillStyle='#9cc789';c.beginPath();c.moveTo(0,h*.42);for(let x=0;x<=w;x+=80)c.lineTo(x,h*.31+Math.sin(x*.013+this.local.distance*.0009)*34);c.lineTo(w,h*.62);c.lineTo(0,h*.62);c.fill();
-      c.fillStyle='#60945d';c.beginPath();c.moveTo(0,h*.5);for(let x=0;x<=w;x+=55)c.lineTo(x,h*.39+Math.sin(x*.02+1.4)*24);c.lineTo(w,h*.66);c.lineTo(0,h*.66);c.fill();
-      c.fillStyle='#4f9e63';c.fillRect(0,h*.52,w,h*.48);
-      for(let i=0;i<18;i++){const x=(i*137-(this.local.distance*1.7)%137+w)%w;const y=h*.48+(i%3)*18;c.fillStyle=i%2?'#2e7445':'#3a8650';c.fillRect(x,y,5,32);c.beginPath();c.arc(x+2,y,13,0,Math.PI*2);c.fill();}
+      const {horizon}=this.cameraGeometry();
+      // Núi nằm đúng tại đường chân trời; phần đường không còn mọc từ giữa bầu trời.
+      c.fillStyle='#a7ca91';c.beginPath();c.moveTo(0,horizon+38);
+      for(let x=0;x<=w;x+=80)c.lineTo(x,horizon-8+Math.sin(x*.012+this.local.distance*.00035)*28);
+      c.lineTo(w,h*.58);c.lineTo(0,h*.58);c.fill();
+      c.fillStyle='#679760';c.beginPath();c.moveTo(0,horizon+70);
+      for(let x=0;x<=w;x+=58)c.lineTo(x,horizon+24+Math.sin(x*.019+1.4)*22);
+      c.lineTo(w,h*.64);c.lineTo(0,h*.64);c.fill();
+      c.fillStyle='#4f9e63';c.fillRect(0,horizon+52,w,h-(horizon+52));
+      for(let i=0;i<18;i++){
+        const x=(i*137-(this.local.distance*.72)%137+w)%w;
+        const y=horizon+72+(i%3)*20;
+        c.fillStyle=i%2?'#2e7445':'#3a8650';c.fillRect(x,y,5,31);c.beginPath();c.arc(x+2,y,12,0,Math.PI*2);c.fill();
+      }
     }
 
     drawRoad(c,w,h){
-      const horizon=h*.18,bottom=h*.99;const gt=this.roadGeometry(horizon),gb=this.roadGeometry(bottom);
-      c.fillStyle='#263b38';c.beginPath();c.moveTo(gt.left,horizon);c.lineTo(gt.left+gt.width,horizon);c.lineTo(gb.left+gb.width,bottom);c.lineTo(gb.left,bottom);c.closePath();c.fill();
-      c.strokeStyle='#e7d9ba';c.lineWidth=8;c.beginPath();c.moveTo(gt.left,horizon);c.lineTo(gb.left,bottom);c.moveTo(gt.left+gt.width,horizon);c.lineTo(gb.left+gb.width,bottom);c.stroke();
-      const offset=(this.local.distance*1.8)%120;
+      const {horizon,roadBottom}=this.cameraGeometry();const gt=this.roadGeometry(horizon),gb=this.roadGeometry(roadBottom);
+      // Vai đường giúp mặt đường bám vào mặt đất thay vì giống một tấm dốc lơ lửng.
+      c.fillStyle='#b9ad8f';c.beginPath();c.moveTo(gt.left-12,horizon);c.lineTo(gt.left+gt.width+12,horizon);c.lineTo(gb.left+gb.width+28,roadBottom);c.lineTo(gb.left-28,roadBottom);c.closePath();c.fill();
+      c.fillStyle='#263b38';c.beginPath();c.moveTo(gt.left,horizon);c.lineTo(gt.left+gt.width,horizon);c.lineTo(gb.left+gb.width,roadBottom);c.lineTo(gb.left,roadBottom);c.closePath();c.fill();
+      c.strokeStyle='#f4e4bd';c.lineWidth=6;c.beginPath();c.moveTo(gt.left,horizon);c.lineTo(gb.left,roadBottom);c.moveTo(gt.left+gt.width,horizon);c.lineTo(gb.left+gb.width,roadBottom);c.stroke();
+      const offset=(this.local.distance*1.65)%132;
       for(let lane=1;lane<this.lanes;lane++){
-        for(let k=0;k<11;k++){
-          const rel=k*120-offset;const q=clamp(1-rel/1200,0,1);const y=horizon+Math.pow(q,1.5)*(bottom-horizon);const y2=Math.min(bottom,y+lerp(3,34,q));
+        for(let k=0;k<12;k++){
+          const rel=k*132-offset;const q=clamp(1-rel/1320,0,1);
+          const y=horizon+Math.pow(q,1.18)*(roadBottom-horizon);const y2=Math.min(roadBottom,y+lerp(2,28,q));
           const g1=this.roadGeometry(y),g2=this.roadGeometry(y2);const x1=g1.left+g1.width*lane/this.lanes,x2=g2.left+g2.width*lane/this.lanes;
-          c.strokeStyle='rgba(255,255,255,.8)';c.lineWidth=lerp(1,5,q);c.beginPath();c.moveTo(x1,y);c.lineTo(x2,y2);c.stroke();
+          c.strokeStyle='rgba(255,255,255,.86)';c.lineWidth=lerp(1,4.5,q);c.beginPath();c.moveTo(x1,y);c.lineTo(x2,y2);c.stroke();
         }
       }
-      for(let k=0;k<16;k++){const rel=k*85-(this.local.distance*2.4)%85;const q=clamp(1-rel/1000,0,1);const y=horizon+Math.pow(q,1.5)*(bottom-horizon);const g=this.roadGeometry(y);c.fillStyle=`rgba(255,255,255,${.03+.07*q})`;c.fillRect(g.left,y,g.width,lerp(1,4,q));}
+      // Vệt nhựa rất nhẹ, không dùng các sọc ngang lớn gây cảm giác đường dựng đứng.
+      for(let k=0;k<11;k++){
+        const rel=k*118-(this.local.distance*1.45)%118;const q=clamp(1-rel/1300,0,1);
+        const y=horizon+Math.pow(q,1.18)*(roadBottom-horizon);const g=this.roadGeometry(y);
+        c.fillStyle=`rgba(255,255,255,${.012+.018*q})`;c.fillRect(g.left,y,g.width,lerp(.5,1.5,q));
+      }
       if(this.settings.mode==='race'){
         const rel=this.totalDistance-this.local.distance;if(rel>0&&rel<this.viewDistance){const p=this.project(rel,0);const g=this.roadGeometry(p.y);const size=Math.max(3,p.scale*17);for(let x=g.left;x<g.left+g.width;x+=size)for(let row=0;row<2;row++){c.fillStyle=((Math.floor((x-g.left)/size)+row)%2)?'#fff':'#111';c.fillRect(x,p.y+row*size,size,size);}}
       }
@@ -455,16 +589,23 @@
     drawObstacle(c,p,item){let im=this.images.obstacles[item.type]||this.images.obstacles.barrier;let base= item.type==='traffic'?95:70;const width=clamp(base*p.scale,12,p.laneW*.82);const ratio=im.height/im.width;c.save();if(item.kind==='oil'){c.fillStyle='rgba(25,20,18,.86)';c.beginPath();c.ellipse(p.x,p.y,width*.46,width*.16,0,0,Math.PI*2);c.fill();}else c.drawImage(im,p.x-width/2,p.y-width*ratio,width,width*ratio);c.restore();}
 
     drawRacers(c){
-      const list=[...this.racers.values()].filter(r=>r.id!==this.local.id).map(r=>({r,rel:r.distance-this.local.distance})).filter(x=>x.rel>-45&&x.rel<this.viewDistance).sort((a,b)=>b.rel-a.rel);
-      for(const {r,rel} of list){const p=this.project(rel,r.lanePos);this.drawCar(c,r,p.x,p.y,p.scale*.9,false);}
-      const p=this.project(5,this.local.lanePos);this.drawCar(c,this.local,p.x,Math.min(this.height*.84,p.y-15),1.08,true);
+      // Góc nhìn phía trước không hiển thị xe đã tụt hẳn ra sau camera.
+      const list=[...this.racers.values()].filter(r=>r.id!==this.local.id).map(r=>({r,rel:r.distance-this.local.distance})).filter(x=>x.rel>-5&&x.rel<this.viewDistance).sort((a,b)=>b.rel-a.rel);
+      for(const {r,rel} of list){const p=this.project(Math.max(0,rel),r.lanePos);this.drawCar(c,r,p.x,p.y,p.scale*.91,false,p.laneW);}
+      const p=this.project(0,this.local.lanePos);this.drawCar(c,this.local,p.x,p.y,1.02,true,p.laneW);
     }
 
-    drawCar(c,r,x,y,s,isLocal){
-      const im=this.images.cars[r.color%this.images.cars.length];const road=this.roadGeometry(y);const width=Math.min(clamp(66*s,20,isLocal?105:96),(road.width/this.lanes)*.82);const ratio=im.height/im.width;const blink=performance.now()<r.invincibleUntil&&Math.floor(performance.now()/110)%2===0;
-      c.save();c.globalAlpha=blink ? .3 : 1;c.shadowColor=isLocal?'rgba(255,210,80,.8)':'rgba(0,0,0,.25)';c.shadowBlur=isLocal?18:8;c.drawImage(im,x-width/2,y-width*ratio,width,width*ratio);c.shadowBlur=0;
-      const avSize=clamp(23*s,10,32);const av=this.images.avatars[(r.avatar-1)%this.images.avatars.length];c.fillStyle='rgba(255,255,255,.9)';c.beginPath();c.arc(x,y-width*ratio*.72,avSize*.55,0,Math.PI*2);c.fill();try{c.drawImage(av,x-avSize/2,y-width*ratio*.72-avSize/2,avSize,avSize);}catch{}
-      c.font=`800 ${clamp(10*s,8,15)}px sans-serif`;c.textAlign='center';c.fillStyle='#fff';c.strokeStyle='rgba(0,0,0,.65)';c.lineWidth=3;c.strokeText(r.name,x,y+14*s);c.fillText(r.name,x,y+14*s);c.restore();
+    drawCar(c,r,x,y,s,isLocal,laneW){
+      const im=this.images.cars[r.color%this.images.cars.length];
+      const width=Math.min(clamp(62*s,18,isLocal?92:88),laneW*.60);const ratio=im.height/im.width;
+      const carH=width*ratio;const blink=performance.now()<r.invincibleUntil&&Math.floor(performance.now()/110)%2===0;
+      c.save();
+      // Bóng tiếp xúc nằm ngay dưới bánh xe để xe có cảm giác bám mặt đường.
+      c.globalAlpha=.26;c.fillStyle='#07120f';c.beginPath();c.ellipse(x,y-2,width*.43,Math.max(3,width*.12),0,0,Math.PI*2);c.fill();
+      c.globalAlpha=blink?.3:1;c.shadowColor=isLocal?'rgba(255,210,80,.72)':'rgba(0,0,0,.22)';c.shadowBlur=isLocal?15:6;
+      c.drawImage(im,x-width/2,y-carH,width,carH);c.shadowBlur=0;
+      const avSize=clamp(22*s,9,30);const av=this.images.avatars[(r.avatar-1)%this.images.avatars.length];c.fillStyle='rgba(255,255,255,.94)';c.beginPath();c.arc(x,y-carH*.72,avSize*.55,0,Math.PI*2);c.fill();try{c.drawImage(av,x-avSize/2,y-carH*.72-avSize/2,avSize,avSize);}catch{}
+      c.font=`800 ${clamp(10*s,8,14)}px sans-serif`;c.textAlign='center';c.fillStyle='#fff';c.strokeStyle='rgba(0,0,0,.72)';c.lineWidth=3;c.strokeText(r.name,x,y+13*s);c.fillText(r.name,x,y+13*s);c.restore();
     }
 
     drawSpeedLines(c){if(this.local.speed<118)return;const strength=clamp((this.local.speed-118)/45,0,1);c.strokeStyle=`rgba(255,255,255,${.15+.35*strength})`;c.lineWidth=2;for(let i=0;i<18;i++){const x=(i*83+this.local.distance*5)%this.width,y=(i*59+this.local.distance*7)%this.height;c.beginPath();c.moveTo(x,y);c.lineTo(x+(x-this.width/2)*.08,y+30+50*strength);c.stroke();}}
