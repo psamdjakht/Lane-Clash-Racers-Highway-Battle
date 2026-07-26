@@ -3,8 +3,8 @@
   Khi để nguyên PLACEHOLDER, game tự chạy ở chế độ Demo cục bộ giữa các tab cùng máy.
 */
 window.LCR_CONFIG = {
-  SUPABASE_URL: 'YOUR_SUPABASE_URL',
-  SUPABASE_ANON_KEY: 'YOUR_SUPABASE_ANON_KEY',
+  SUPABASE_URL: 'https://dihulrftlaowylurllrb.supabase.co',
+  SUPABASE_ANON_KEY: 'sb_publishable_BvrKWOBiHPnCjBNGYRAsew_QM5RGe1M',
   ROOM_EXPIRE_HOURS: 12,
   STATE_SEND_HZ: 10
 };
