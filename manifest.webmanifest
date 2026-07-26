@@ -1,0 +1,14 @@
+{
+  "name": "Lane Clash Racers: Highway Battle",
+  "short_name": "Lane Clash",
+  "description": "Đua xe nhiều làn multiplayer trên đường cao tốc.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#e8f7f0",
+  "theme_color": "#17694f",
+  "orientation": "any",
+  "icons": [
+    {"src":"assets/icon-192.png","sizes":"192x192","type":"image/png"},
+    {"src":"assets/icon-512.png","sizes":"512x512","type":"image/png"}
+  ]
+}
