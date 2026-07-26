@@ -1,0 +1,10 @@
+LANE CLASH RACERS v1.3 - BẢN VÁ NHANH
+
+1. Giải nén file ZIP.
+2. Tải toàn bộ thư mục và file bên trong lên repository GitHub hiện tại.
+3. Chọn ghi đè các file trùng tên.
+4. Không xóa hoặc thay js/config.js đang chứa cấu hình Supabase của bạn.
+5. Chờ GitHub Pages deploy xong, sau đó nhấn Ctrl + F5.
+6. Nếu vẫn thấy bản cũ: F12 > Application > Service Workers > Unregister, rồi tải lại.
+
+Bản vá không chứa config.js và không thay đổi cơ sở dữ liệu Supabase.

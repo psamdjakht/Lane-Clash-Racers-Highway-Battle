@@ -1,6 +1,12 @@
 (() => {
   'use strict';
-  const CAR_FILES = ['green','orange','red','white','blue','purple','pink','yellow'].map(x => `assets/cars/car-${x}.png`);
+  const CAR_COLORS = ['green','orange','red','white','blue','purple','pink','yellow'];
+  const CAR_FILES = CAR_COLORS.map(x => `assets/cars/car-${x}.png`);
+  const PERSPECTIVE_CAR_FILES = CAR_COLORS.map(color => ({
+    n:`assets/cars/perspective/car-${color}-n.png`,
+    ne:`assets/cars/perspective/car-${color}-ne.png`,
+    nw:`assets/cars/perspective/car-${color}-nw.png`
+  }));
   const AVATAR = i => `assets/avatars/avatar-${String(i).padStart(2,'0')}.png`;
   const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
   const lerp = (a,b,t) => a+(b-a)*t;
@@ -28,7 +34,7 @@
       };
       this.lanes=clamp(Number(this.settings.laneCount)||4,2,8);
       this.duration=Number(this.settings.durationSeconds)||0;
-      this.totalDistance=this.settings.mode==='race' ? Math.max(2500,(this.duration||120)*92) : Infinity;
+      this.totalDistance=this.settings.mode==='race' ? Math.max(3200,(this.duration||120)*128) : Infinity;
       this.seed=room.seed||12345;
       this.rng=new RNG(this.seed);
       this.courseRng=new RNG(this.seed ^ 0x9e3779b9);
@@ -36,7 +42,8 @@
       this.racers=new Map(); this.local=null; this.ai=[];
       this.running=false; this.ended=false; this.startAt=0; this.lastTs=0; this.elapsed=0;
       this.sendAccumulator=0; this.firstFinishAt=0; this.endlessEndSent=false;
-      this.viewDistance=1120; this.playerAnchorRatio=.855; this.collisionGap=58; this.keys={}; this.images={cars:[],avatars:[],obstacles:{}};
+      this.viewDistance=640; this.playerAnchorRatio=.875; this.collisionGap=72; this.carFrontWorld=58; this.carRearWorld=22; this.keys={}; this.images={cars:[],perspectiveCars:[],avatars:[],obstacles:{}};
+      this.curvePhase=(this.seed%997)*.00617; this.roadSliceDepth=12;
       this.nitro={active:false,start:0,passDuration:.72,pos:0,pass:0,nextIndex:0,nextEndless:850};
       this.lastFrameRequest=0; this.resizeObserver=null;
       this.boundResize=()=>this.resize();
@@ -70,16 +77,17 @@
       const startDistance=-Math.floor(normalizedSlot/this.lanes)*72;
       return {id,name,avatar:Number(avatar)||1,color:Number(color)||0,slot:normalizedSlot,isAI,
         lane:startLane,targetLane:startLane,lanePos:startLane,
-        distance:startDistance,speed:0,targetSpeed:72,score:0,coins:0,finished:false,finishTime:null,
+        distance:startDistance,prevDistance:startDistance,speed:0,targetSpeed:104,score:0,coins:0,finished:false,finishTime:null,
         invincibleUntil:0,shield:0,ghostUntil:0,magnetUntil:0,jammedUntil:0,boostUntil:0,boostAmount:0,
         lastHit:0,lastCarHit:0,lastDecision:0,nextBlockedNotice:0,aiReaction:lerp(.78,.18,diff/10)+Math.random()*.18,
-        aiSkill:clamp(diff/10+(Math.random()-.5)*.18,.1,1),collected:new Set(),local:false,displayDistance:0,
+        aiSkill:clamp(diff/10+(Math.random()-.5)*.18,.1,1),collected:new Set(),hitObstacles:new Set(),local:false,displayDistance:0,
         netDistance:null,netLanePos:null,netReceivedAt:0};
     }
 
     async load(){
       const loadImage=src=>new Promise((resolve,reject)=>{const im=new Image();im.onload=()=>resolve(im);im.onerror=reject;im.src=src;});
       this.images.cars=await Promise.all(CAR_FILES.map(loadImage));
+      this.images.perspectiveCars=await Promise.all(PERSPECTIVE_CAR_FILES.map(async frames=>({n:await loadImage(frames.n),ne:await loadImage(frames.ne),nw:await loadImage(frames.nw)})));
       this.images.avatars=await Promise.all(Array.from({length:22},(_,i)=>loadImage(AVATAR(i+1))));
       const pairs={barrier:'assets/obstacles/barrier-red.png',pylon:'assets/obstacles/pylon.png',traffic:'assets/obstacles/traffic-car.png'};
       await Promise.all(Object.entries(pairs).map(async([k,v])=>this.images.obstacles[k]=await loadImage(v)));
@@ -191,14 +199,15 @@
 
     currentBaseSpeed(r){
       const progress=this.settings.mode==='race'?clamp(r.distance/this.totalDistance,0,1):clamp(this.elapsed/240,0,1);
-      return 70+progress*38;
+      return 104+progress*62;
     }
 
     updateRacer(r,dt,ts,isAI){
+      r.prevDistance=r.distance;
       if(r.finished){r.speed=Math.max(0,r.speed-dt*40);return;}
       const base=this.currentBaseSpeed(r)+(isAI?(r.aiSkill-.5)*9:0);
       const boost=ts<r.boostUntil?r.boostAmount:0;if(ts>=r.boostUntil)r.boostAmount=0;
-      let desiredSpeed=clamp(base+boost,45,175);
+      let desiredSpeed=clamp(base+boost,70,235);
       // Xe phía sau phải giữ khoảng cách thay vì chạy xuyên vào xe phía trước.
       const ahead=this.findNearestAhead(r,r.targetLane,185);
       if(ahead){
@@ -210,7 +219,7 @@
         }
       }
       r.targetSpeed=desiredSpeed;
-      r.speed=lerp(r.speed||0,r.targetSpeed,clamp(dt*(boost?4.2:2.8),0,1));
+      r.speed=lerp(r.speed||0,r.targetSpeed,clamp(dt*(boost?5.4:3.8),0,1));
       const delta=r.targetLane-r.lanePos;
       const laneRate=ts<r.jammedUntil?2.35:3.65;
       const step=clamp(delta,-laneRate*dt,laneRate*dt);
@@ -288,11 +297,73 @@
       else {r.lane=current;r.targetLane=current;}
     }
 
+    obstacleProfile(item){
+      if(item.kind==='oil')return {halfDepth:17,laneHalf:.43};
+      if(item.type==='traffic')return {halfDepth:38,laneHalf:.39};
+      if(item.type==='pylon')return {halfDepth:10,laneHalf:.22};
+      return {halfDepth:13,laneHalf:.36};
+    }
+
+    itemTouchesRacer(r,item){
+      const profile=this.obstacleProfile(item);
+      const lateral=Math.abs(item.lane-r.lanePos);
+      if(lateral>profile.laneHalf+.28)return false;
+      const previous=r.prevDistance??r.distance;
+      const frontPrev=previous+this.obstacleFrontWorld;
+      const frontNow=r.distance+this.obstacleFrontWorld;
+      const rearNow=r.distance-this.carRearWorld;
+      const obstacleNear=item.z-profile.halfDepth;
+      const obstacleFar=item.z+profile.halfDepth;
+      return frontNow>=obstacleNear&&rearNow<=obstacleFar&&frontPrev<=obstacleFar;
+    }
+
+    localVisualObstacleTouch(item){
+      const r=this.local;
+      const carPoint=this.project(0,r.lanePos),angle=this.vehicleHeading(0,r);
+      const metrics=this.carMetrics(r,1.04,true,carPoint.laneW,angle);
+      // Mũi xe nằm gần đầu sprite; chạm ở mũi là va chạm ngay, không đợi vật cản lọt vào giữa thân xe.
+      const noseX=carPoint.x+Math.sin(angle)*metrics.height*.90;
+      const noseY=carPoint.y-Math.cos(angle)*metrics.height*.90;
+      const rel=item.z-r.distance,previousRel=item.z-(r.prevDistance??r.distance);
+      const point=this.project(rel,item.lane),previousPoint=this.project(previousRel,item.lane);
+      const obstacle=this.obstacleVisualMetrics(item,point);
+      const previousObstacle=this.obstacleVisualMetrics(item,previousPoint);
+      const horizontal=Math.abs(point.x-noseX)<=obstacle.width*.48+metrics.width*.27;
+      const obstacleTop=point.y-obstacle.height, obstacleBottom=point.y;
+      const previousBottom=previousPoint.y;
+      const crossed=previousBottom<noseY-1&&obstacleBottom>=noseY-1;
+      const touching=obstacleTop<=noseY+4&&obstacleBottom>=noseY-4;
+      return horizontal&&(crossed||touching);
+    }
+
+    obstacleVisualMetrics(item,p){
+      if(item.kind==='oil')return {width:clamp(62*p.scale,12,p.laneW*.76),height:clamp(17*p.scale,4,18)};
+      const im=this.images.obstacles[item.type]||this.images.obstacles.barrier;
+      const base=item.type==='traffic'?102:72;
+      const width=clamp(base*p.scale,12,p.laneW*.82);
+      return {width,height:width*(im?.height||1)/(im?.width||1)};
+    }
+
+    pickupTouchesRacer(r,item){
+      const previous=r.prevDistance??r.distance;
+      const frontPrev=previous+this.carFrontWorld*.82;
+      const frontNow=r.distance+this.carFrontWorld*.82;
+      return frontNow>=item.z-7&&r.distance-this.carRearWorld<=item.z+12&&frontPrev<=item.z+12;
+    }
+
+    racersTouch(a,b){
+      if(Math.abs(a.lanePos-b.lanePos)>=.49)return false;
+      const aFront=a.distance+this.carFrontWorld,aRear=a.distance-this.carRearWorld;
+      const bFront=b.distance+this.carFrontWorld,bRear=b.distance-this.carRearWorld;
+      return aFront>=bRear&&bFront>=aRear;
+    }
+
     aiCollisions(r,ts){
       if(ts<r.invincibleUntil||ts<r.ghostUntil)return;
       for(const item of this.items.concat(this.dynamicItems)){
-        if(item.kind!=='obstacle'&&item.kind!=='oil')continue;
-        if(Math.abs(item.z-r.distance)<24&&Math.abs(item.lane-r.lanePos)<.42){
+        if((item.kind!=='obstacle'&&item.kind!=='oil')||r.hitObstacles.has(item.id))continue;
+        if(this.itemTouchesRacer(r,item)){
+          r.hitObstacles.add(item.id);
           if(r.shield>0){r.shield--;return;}r.speed*=.48;r.invincibleUntil=ts+Number(this.settings.invincibleSeconds||2)*1000;r.score-=20;return;
         }
       }
@@ -337,13 +408,16 @@
       const r=this.local;
       for(const item of this.items.concat(this.dynamicItems)){
         if(r.collected.has(item.id))continue;
-        const laneDist=Math.abs(item.lane-r.lanePos),zDist=Math.abs(item.z-r.distance);
+        const laneDist=Math.abs(item.lane-r.lanePos);
         if(item.kind==='coin'&&ts<r.magnetUntil&&item.z>r.distance-30&&item.z-r.distance<230&&laneDist<=2.1){this.collectCoin(item,r);continue;}
-        if(zDist>27||laneDist>.43)continue;
-        if(item.kind==='coin')this.collectCoin(item,r);
-        else if(item.kind==='power'){r.collected.add(item.id);this.applyPower(item.type,ts);}
-        else if((item.kind==='obstacle'||item.kind==='oil')&&ts>=r.invincibleUntil&&ts>=r.ghostUntil){
-          r.collected.add(item.id);this.hitObstacle(item,ts);
+        if(item.kind==='coin'||item.kind==='power'){
+          if(laneDist>.43||!this.pickupTouchesRacer(r,item))continue;
+          if(item.kind==='coin')this.collectCoin(item,r);
+          else {r.collected.add(item.id);this.applyPower(item.type,ts);}
+          continue;
+        }
+        if((item.kind==='obstacle'||item.kind==='oil')&&!r.hitObstacles.has(item.id)&&ts>=r.invincibleUntil&&ts>=r.ghostUntil&&this.localVisualObstacleTouch(item)){
+          r.hitObstacles.add(item.id);this.hitObstacle(item,ts);
         }
       }
     }
@@ -382,12 +456,9 @@
       const r=this.local;if(ts<r.invincibleUntil||ts<r.ghostUntil||ts-r.lastCarHit<700)return;
       for(const other of this.racers.values()){
         if(other.id===r.id||other.finished)continue;
-        const longitudinal=Math.abs(other.distance-r.distance);
-        const lateral=Math.abs(other.lanePos-r.lanePos);
-        if(longitudinal<31&&lateral<.48){
+        if(this.racersTouch(r,other)){
           if(r.shield>0){r.shield--;r.lastCarHit=ts;this.showGrade('SHIELD');return;}
           r.speed*=.70;r.lastCarHit=ts;r.invincibleUntil=ts+Number(this.settings.invincibleSeconds||2)*1000;
-          // Bị ép làn thì xe quay về tâm làn gần nhất, không xuyên qua thân xe khác.
           const safeLane=clamp(Math.round(r.lanePos),0,this.lanes-1);r.targetLane=safeLane;r.lane=safeLane;
           this.showGrade('VA CHẠM');return;
         }
@@ -485,7 +556,7 @@
     updateHud(){
       const r=this.local;const ordered=[...this.racers.values()].sort((a,b)=>this.settings.mode==='endless'?b.score-a.score:b.distance-a.distance);
       const rank=Math.max(1,ordered.findIndex(x=>x.id===r.id)+1);
-      this.hud.speed.textContent=Math.round(r.speed*2.55);this.hud.rank.textContent=`${rank}/${this.racers.size}`;this.hud.score.textContent=Math.max(0,Math.round(r.score));this.hud.coin.textContent=r.coins;
+      this.hud.speed.textContent=Math.round(r.speed*1.88);this.hud.rank.textContent=`${rank}/${this.racers.size}`;this.hud.score.textContent=Math.max(0,Math.round(r.score));this.hud.coin.textContent=r.coins;
       if(this.settings.mode==='race'){
         const p=clamp(r.distance/this.totalDistance,0,1);this.hud.progress.style.width=`${p*100}%`;this.hud.distance.textContent=`${Math.round(p*100)}%`;this.hud.timer.textContent=formatTime(this.elapsed);
       }else{
@@ -496,119 +567,227 @@
     }
 
     cameraGeometry(){
-      const horizon=this.height*.305;
-      const roadBottom=this.height*1.015;
+      const compact=this.width<700;
+      const horizon=this.height*(compact?.255:.275);
+      const roadBottom=this.height*1.09;
       const playerY=this.height*this.playerAnchorRatio;
-      return {horizon,roadBottom,playerY};
+      const projectionExponent=1.42;
+      const playerT=clamp((playerY-horizon)/(roadBottom-horizon),.01,.99);
+      const playerQ=Math.pow(playerT,1/projectionExponent);
+      const rearDistance=this.viewDistance*(1/playerQ-1);
+      return {horizon,roadBottom,playerY,projectionExponent,playerQ,rearDistance};
     }
 
     roadGeometry(y){
       const {horizon,roadBottom}=this.cameraGeometry();
       const t=clamp((y-horizon)/(roadBottom-horizon),0,1);
-      const eased=Math.pow(t,1.08);
-      const maxRoadW=this.width*(this.width<700?.965:.86);
-      const desiredLaneW=clamp(this.width/(this.lanes+3.0),88,164);
-      const bottomW=Math.min(maxRoadW,desiredLaneW*this.lanes+70);
-      const topW=Math.max(Math.min(this.width*.34,bottomW*.54),Math.min(210,bottomW*.48));
-      const w=lerp(topW,bottomW,eased);
-      // Độ cong rất nhẹ để đường vẫn là cao tốc, không tạo cảm giác dốc lên trời.
-      const curve=Math.sin(this.local.distance/1650+t*1.8)*this.width*.012*(1-t);
-      return {left:this.width/2-w/2+curve,width:w,t};
+      const eased=Math.pow(t,1.06);
+      const maxRoadW=this.width*(this.width<700?.975:.82);
+      const desiredLaneW=clamp(this.width/(this.lanes+3.05),78,190);
+      const bottomW=Math.min(maxRoadW,desiredLaneW*this.lanes+82);
+      const topW=Math.max(105,Math.min(this.width*.27,bottomW*.285));
+      const width=lerp(topW,bottomW,eased);
+      return {width,t,eased};
     }
 
-    project(relDistance,lane){
-      const {horizon,playerY}=this.cameraGeometry();
-      const q=clamp(1-relDistance/this.viewDistance,0,1);
-      const y=horizon+Math.pow(q,1.16)*(playerY-horizon);
+    curveRaw(z){
+      const phase=this.curvePhase;
+      const warm=clamp((z-180)/520,0,1);const envelope=warm*warm*(3-2*warm);
+      return envelope*(
+        Math.sin(z/940+phase)*1.12+
+        Math.sin(z/1760+phase*1.83)*.72+
+        Math.sin(z/510+phase*.61)*.30
+      );
+    }
+
+    curveSlopeAt(z){
+      const e=6;
+      return (this.curveRaw(z+e)-this.curveRaw(z-e))/(e*2);
+    }
+
+    roadCurveOffsetLanes(relDistance){
+      const baseZ=this.local?.distance||0;
+      const z=baseZ+relDistance;
+      // Camera nhìn theo tiếp tuyến ngay tại xe, nên đoạn dưới bánh xe luôn ổn định;
+      // phần đường phía trước mới uốn cong giống game OutRun/pseudo-3D.
+      const raw=this.curveRaw(z)-this.curveRaw(baseZ)-this.curveSlopeAt(baseZ)*relDistance;
+      const fade=clamp(Math.abs(relDistance)/75,0,1);
+      const limit=Math.min(2.8,Math.max(.9,this.lanes*.34));
+      return clamp(raw*fade*2.75,-limit,limit);
+    }
+
+    projectFraction(relDistance,fraction){
+      const {horizon,roadBottom,projectionExponent,playerQ,rearDistance}=this.cameraGeometry();
+      const q=clamp((this.viewDistance-relDistance)/(this.viewDistance+rearDistance),0,1);
+      const y=horizon+Math.pow(q,projectionExponent)*(roadBottom-horizon);
       const g=this.roadGeometry(y);const laneW=g.width/this.lanes;
-      return {x:g.left+(lane+.5)*laneW,y,scale:lerp(.16,1.02,Math.pow(q,1.18)),laneW};
+      const requestedShift=this.roadCurveOffsetLanes(relDistance)*laneW;
+      const maxShift=Math.max(0,(this.width-g.width)/2-8);
+      const centerX=this.width/2+clamp(requestedShift,-maxShift,maxShift);
+      const playerNormalized=clamp(q/playerQ,0,1);
+      const scale=lerp(.10,1.04,Math.pow(playerNormalized,1.26));
+      return {x:centerX+(fraction-.5)*g.width,y,scale,laneW,q,centerX,width:g.width};
+    }
+
+    project(relDistance,lane){return this.projectFraction(relDistance,(lane+.5)/this.lanes);}
+
+    vehicleHeading(relDistance,r){
+      const steer=clamp((r.targetLane-r.lanePos)*.78,-.52,.52);
+      if(r.local&&Math.abs(steer)<.02)return 0;
+      const here=this.project(relDistance,r.lanePos);
+      const ahead=this.project(relDistance+48,clamp(r.lanePos+steer,0,this.lanes-1));
+      return clamp(Math.atan2(ahead.x-here.x,here.y-ahead.y),-.36,.36);
     }
 
     render(){
       const c=this.ctx,w=this.width,h=this.height;if(!w||!h)return;
-      const sky=c.createLinearGradient(0,0,0,h*.65);sky.addColorStop(0,'#77c7ee');sky.addColorStop(1,'#e9f7ff');c.fillStyle=sky;c.fillRect(0,0,w,h);
+      const sky=c.createLinearGradient(0,0,0,h*.64);sky.addColorStop(0,'#79c9ef');sky.addColorStop(1,'#e8f7ff');c.fillStyle=sky;c.fillRect(0,0,w,h);
       this.drawBackground(c,w,h);this.drawRoad(c,w,h);this.drawWorldItems(c);this.drawRacers(c);this.drawSpeedLines(c);
     }
 
     drawBackground(c,w,h){
       const {horizon}=this.cameraGeometry();
-      // Núi nằm đúng tại đường chân trời; phần đường không còn mọc từ giữa bầu trời.
-      c.fillStyle='#a7ca91';c.beginPath();c.moveTo(0,horizon+38);
-      for(let x=0;x<=w;x+=80)c.lineTo(x,horizon-8+Math.sin(x*.012+this.local.distance*.00035)*28);
+      c.fillStyle='#a7ca91';c.beginPath();c.moveTo(0,horizon+35);
+      for(let x=0;x<=w;x+=75)c.lineTo(x,horizon-9+Math.sin(x*.011+this.local.distance*.00012)*26);
       c.lineTo(w,h*.58);c.lineTo(0,h*.58);c.fill();
-      c.fillStyle='#679760';c.beginPath();c.moveTo(0,horizon+70);
-      for(let x=0;x<=w;x+=58)c.lineTo(x,horizon+24+Math.sin(x*.019+1.4)*22);
+      c.fillStyle='#679760';c.beginPath();c.moveTo(0,horizon+67);
+      for(let x=0;x<=w;x+=58)c.lineTo(x,horizon+23+Math.sin(x*.019+1.4)*21);
       c.lineTo(w,h*.64);c.lineTo(0,h*.64);c.fill();
-      c.fillStyle='#4f9e63';c.fillRect(0,horizon+52,w,h-(horizon+52));
-      for(let i=0;i<18;i++){
-        const x=(i*137-(this.local.distance*.72)%137+w)%w;
-        const y=horizon+72+(i%3)*20;
-        c.fillStyle=i%2?'#2e7445':'#3a8650';c.fillRect(x,y,5,31);c.beginPath();c.arc(x+2,y,12,0,Math.PI*2);c.fill();
+      c.fillStyle='#4f9e63';c.fillRect(0,horizon+50,w,h-(horizon+50));
+      for(let i=0;i<20;i++){
+        const x=(i*149-(this.local.distance*.10)%149+w)%w;
+        const y=horizon+68+(i%3)*19;
+        c.fillStyle=i%2?'#2e7445':'#3a8650';c.fillRect(x,y,5,30);c.beginPath();c.arc(x+2,y,12,0,Math.PI*2);c.fill();
       }
     }
 
+    fillQuad(c,a,b,d,e,color){
+      c.fillStyle=color;c.beginPath();c.moveTo(a.x,a.y);c.lineTo(b.x,b.y);c.lineTo(e.x,e.y);c.lineTo(d.x,d.y);c.closePath();c.fill();
+    }
+
     drawRoad(c,w,h){
-      const {horizon,roadBottom}=this.cameraGeometry();const gt=this.roadGeometry(horizon),gb=this.roadGeometry(roadBottom);
-      // Vai đường giúp mặt đường bám vào mặt đất thay vì giống một tấm dốc lơ lửng.
-      c.fillStyle='#b9ad8f';c.beginPath();c.moveTo(gt.left-12,horizon);c.lineTo(gt.left+gt.width+12,horizon);c.lineTo(gb.left+gb.width+28,roadBottom);c.lineTo(gb.left-28,roadBottom);c.closePath();c.fill();
-      c.fillStyle='#263b38';c.beginPath();c.moveTo(gt.left,horizon);c.lineTo(gt.left+gt.width,horizon);c.lineTo(gb.left+gb.width,roadBottom);c.lineTo(gb.left,roadBottom);c.closePath();c.fill();
-      c.strokeStyle='#f4e4bd';c.lineWidth=6;c.beginPath();c.moveTo(gt.left,horizon);c.lineTo(gb.left,roadBottom);c.moveTo(gt.left+gt.width,horizon);c.lineTo(gb.left+gb.width,roadBottom);c.stroke();
-      const offset=(this.local.distance*1.65)%132;
+      const {rearDistance}=this.cameraGeometry();
+      const near=-rearDistance,far=this.viewDistance,step=this.roadSliceDepth;
+      const samples=[];
+      for(let rel=far;rel>near;rel-=step){
+        samples.push({
+          left:this.projectFraction(rel,0),right:this.projectFraction(rel,1),
+          shoulderLeft:this.projectFraction(rel,-.035),shoulderRight:this.projectFraction(rel,1.035)
+        });
+      }
+      samples.push({
+        left:this.projectFraction(near,0),right:this.projectFraction(near,1),
+        shoulderLeft:this.projectFraction(near,-.035),shoulderRight:this.projectFraction(near,1.035)
+      });
+      const fillStrip=(leftKey,rightKey,color)=>{
+        c.fillStyle=color;c.beginPath();
+        c.moveTo(samples[0][leftKey].x,samples[0][leftKey].y);
+        for(let i=1;i<samples.length;i++)c.lineTo(samples[i][leftKey].x,samples[i][leftKey].y);
+        for(let i=samples.length-1;i>=0;i--)c.lineTo(samples[i][rightKey].x,samples[i][rightKey].y);
+        c.closePath();c.fill();
+      };
+      // Một polygon liền cho vai đường và một polygon liền cho mặt nhựa:
+      // không còn các khe ngang khiến mặt đường giống tấm lưới hoặc vật thể trôi lệch.
+      fillStrip('shoulderLeft','shoulderRight','#c8b991');
+      fillStrip('left','right','#263b38');
+      c.lineWidth=5;c.strokeStyle='#f4e4bd';c.lineJoin='round';
+      for(const key of ['left','right']){
+        c.beginPath();c.moveTo(samples[0][key].x,samples[0][key].y);
+        for(let i=1;i<samples.length;i++)c.lineTo(samples[i][key].x,samples[i][key].y);
+        c.stroke();
+      }
+      const dashPeriod=78,dashLength=34;
+      const first=Math.floor((this.local.distance-rearDistance)/dashPeriod)-1;
+      const last=Math.ceil((this.local.distance+this.viewDistance)/dashPeriod)+1;
       for(let lane=1;lane<this.lanes;lane++){
-        for(let k=0;k<12;k++){
-          const rel=k*132-offset;const q=clamp(1-rel/1320,0,1);
-          const y=horizon+Math.pow(q,1.18)*(roadBottom-horizon);const y2=Math.min(roadBottom,y+lerp(2,28,q));
-          const g1=this.roadGeometry(y),g2=this.roadGeometry(y2);const x1=g1.left+g1.width*lane/this.lanes,x2=g2.left+g2.width*lane/this.lanes;
-          c.strokeStyle='rgba(255,255,255,.86)';c.lineWidth=lerp(1,4.5,q);c.beginPath();c.moveTo(x1,y);c.lineTo(x2,y2);c.stroke();
+        const fraction=lane/this.lanes;
+        for(let n=first;n<=last;n++){
+          const z0=n*dashPeriod,z1=z0+dashLength;
+          const rel0=z0-this.local.distance,rel1=z1-this.local.distance;
+          if(rel1<-rearDistance||rel0>this.viewDistance)continue;
+          const nearP=this.projectFraction(rel0,fraction),farP=this.projectFraction(rel1,fraction);
+          c.strokeStyle='rgba(255,255,255,.91)';c.lineWidth=clamp(1+nearP.scale*4.3,1.1,5.6);c.lineCap='round';
+          c.beginPath();c.moveTo(farP.x,farP.y);c.lineTo(nearP.x,nearP.y);c.stroke();
         }
       }
-      // Vệt nhựa rất nhẹ, không dùng các sọc ngang lớn gây cảm giác đường dựng đứng.
-      for(let k=0;k<11;k++){
-        const rel=k*118-(this.local.distance*1.45)%118;const q=clamp(1-rel/1300,0,1);
-        const y=horizon+Math.pow(q,1.18)*(roadBottom-horizon);const g=this.roadGeometry(y);
-        c.fillStyle=`rgba(255,255,255,${.012+.018*q})`;c.fillRect(g.left,y,g.width,lerp(.5,1.5,q));
-      }
       if(this.settings.mode==='race'){
-        const rel=this.totalDistance-this.local.distance;if(rel>0&&rel<this.viewDistance){const p=this.project(rel,0);const g=this.roadGeometry(p.y);const size=Math.max(3,p.scale*17);for(let x=g.left;x<g.left+g.width;x+=size)for(let row=0;row<2;row++){c.fillStyle=((Math.floor((x-g.left)/size)+row)%2)?'#fff':'#111';c.fillRect(x,p.y+row*size,size,size);}}
+        const rel=this.totalDistance-this.local.distance;
+        if(rel>-rearDistance&&rel<this.viewDistance){
+          const depth=20,rows=2;
+          for(let row=0;row<rows;row++)for(let col=0;col<this.lanes*4;col++){
+            const farRel=rel+row*depth/rows,nearRel=rel+(row+1)*depth/rows;
+            const f0=col/(this.lanes*4),f1=(col+1)/(this.lanes*4);
+            const a=this.projectFraction(farRel,f0),b=this.projectFraction(farRel,f1),d=this.projectFraction(nearRel,f0),e=this.projectFraction(nearRel,f1);
+            this.fillQuad(c,a,b,d,e,(col+row)%2?'#fff':'#111');
+          }
+        }
       }
     }
 
     drawWorldItems(c){
-      const visible=this.items.concat(this.dynamicItems).filter(i=>!this.local.collected.has(i.id)&&i.z-this.local.distance>-20&&i.z-this.local.distance<this.viewDistance).sort((a,b)=>b.z-a.z);
-      for(const item of visible){const rel=item.z-this.local.distance,p=this.project(rel,item.lane);if(p.y<this.height*.17)continue;
+      const visible=this.items.concat(this.dynamicItems).filter(i=>!this.local.collected.has(i.id)&&i.z-this.local.distance>-26&&i.z-this.local.distance<this.viewDistance).sort((a,b)=>b.z-a.z);
+      for(const item of visible){const rel=item.z-this.local.distance,p=this.project(rel,item.lane);if(p.y<this.height*.14)continue;
         if(item.kind==='coin')this.drawCoin(c,p.x,p.y,p.scale,item.value);
         else if(item.kind==='power')this.drawPower(c,p.x,p.y,p.scale,item.type);
-        else this.drawObstacle(c,p,item);
+        else this.drawObstacle(c,p,item,rel);
       }
     }
 
-    drawCoin(c,x,y,s,value){const r=clamp(7*s,3,15);c.save();c.translate(x,y);c.fillStyle=value>=50?'#fff2a0':'#ffd34f';c.strokeStyle='#de8d19';c.lineWidth=Math.max(1,2*s);c.beginPath();c.ellipse(0,0,r*.65,r,0,0,Math.PI*2);c.fill();c.stroke();c.fillStyle='#bd7919';c.font=`${Math.max(6,10*s)}px sans-serif`;c.textAlign='center';c.textBaseline='middle';c.fillText('$',0,0);c.restore();}
+    drawCoin(c,x,y,s,value){const r=clamp(7.5*s,2.6,16);c.save();c.translate(x,y);c.fillStyle=value>=50?'#fff2a0':'#ffd34f';c.strokeStyle='#de8d19';c.lineWidth=Math.max(1,2*s);c.beginPath();c.ellipse(0,0,r*.65,r,0,0,Math.PI*2);c.fill();c.stroke();c.fillStyle='#bd7919';c.font=`${Math.max(6,10*s)}px sans-serif`;c.textAlign='center';c.textBaseline='middle';c.fillText('$',0,0);c.restore();}
 
-    drawPower(c,x,y,s,type){const icons={shield:'🛡',ghost:'👻',magnet:'🧲',turbo:'⚡',shockwave:'💥',oil:'🛢'};const r=clamp(14*s,7,28);c.save();c.translate(x,y);c.fillStyle='rgba(255,255,255,.93)';c.strokeStyle='#ff9b42';c.lineWidth=Math.max(1,3*s);c.beginPath();c.arc(0,0,r,0,Math.PI*2);c.fill();c.stroke();c.font=`${Math.max(10,22*s)}px "Segoe UI Emoji"`;c.textAlign='center';c.textBaseline='middle';c.fillText(icons[type]||'?',0,1);c.restore();}
+    drawPower(c,x,y,s,type){const icons={shield:'🛡',ghost:'👻',magnet:'🧲',turbo:'⚡',shockwave:'💥',oil:'🛢'};const r=clamp(14*s,6,28);c.save();c.translate(x,y);c.fillStyle='rgba(255,255,255,.93)';c.strokeStyle='#ff9b42';c.lineWidth=Math.max(1,3*s);c.beginPath();c.arc(0,0,r,0,Math.PI*2);c.fill();c.stroke();c.font=`${Math.max(10,22*s)}px "Segoe UI Emoji"`;c.textAlign='center';c.textBaseline='middle';c.fillText(icons[type]||'?',0,1);c.restore();}
 
-    drawObstacle(c,p,item){let im=this.images.obstacles[item.type]||this.images.obstacles.barrier;let base= item.type==='traffic'?95:70;const width=clamp(base*p.scale,12,p.laneW*.82);const ratio=im.height/im.width;c.save();if(item.kind==='oil'){c.fillStyle='rgba(25,20,18,.86)';c.beginPath();c.ellipse(p.x,p.y,width*.46,width*.16,0,0,Math.PI*2);c.fill();}else c.drawImage(im,p.x-width/2,p.y-width*ratio,width,width*ratio);c.restore();}
+    drawObstacle(c,p,item,rel){
+      const im=this.images.obstacles[item.type]||this.images.obstacles.barrier;
+      const metrics=this.obstacleVisualMetrics(item,p);
+      const ahead=this.project(rel+38,item.lane),angle=clamp(Math.atan2(ahead.x-p.x,p.y-ahead.y),-.34,.34);
+      c.save();c.translate(p.x,p.y);c.rotate(angle);
+      if(item.kind==='oil'){c.fillStyle='rgba(25,20,18,.86)';c.beginPath();c.ellipse(0,0,metrics.width*.46,metrics.height*.54,0,0,Math.PI*2);c.fill();}
+      else c.drawImage(im,-metrics.width/2,-metrics.height,metrics.width,metrics.height);
+      c.restore();
+    }
+
+    carFrame(r,angle){
+      const frames=this.images.perspectiveCars[r.color%this.images.perspectiveCars.length];
+      if(!frames)return {image:this.images.cars[r.color%this.images.cars.length],residual:angle};
+      // Góc cua của đường cao tốc thường nhỏ. Dùng sprite nhìn từ sau và xoay đúng tiếp tuyến
+      // giúp mũi xe luôn cùng hướng mặt đường, không bị nghiêng ngang như sprite isometric 45°.
+      return {image:frames.n,residual:angle};
+    }
+
+    carMetrics(r,s,isLocal,laneW,angle=0){
+      const frame=this.carFrame(r,angle),im=frame.image;
+      let height=clamp(132*s,11,isLocal?145:136);
+      let width=height*(im.width/im.height);
+      const maxWidth=laneW*.64;
+      if(width>maxWidth){const k=maxWidth/width;width*=k;height*=k;}
+      return {frame,width,height,residual:frame.residual};
+    }
 
     drawRacers(c){
-      // Góc nhìn phía trước không hiển thị xe đã tụt hẳn ra sau camera.
-      const list=[...this.racers.values()].filter(r=>r.id!==this.local.id).map(r=>({r,rel:r.distance-this.local.distance})).filter(x=>x.rel>-5&&x.rel<this.viewDistance).sort((a,b)=>b.rel-a.rel);
-      for(const {r,rel} of list){const p=this.project(Math.max(0,rel),r.lanePos);this.drawCar(c,r,p.x,p.y,p.scale*.91,false,p.laneW);}
-      const p=this.project(0,this.local.lanePos);this.drawCar(c,this.local,p.x,p.y,1.02,true,p.laneW);
+      const list=[...this.racers.values()].filter(r=>r.id!==this.local.id).map(r=>({r,rel:r.distance-this.local.distance})).filter(x=>x.rel>-10&&x.rel<this.viewDistance).sort((a,b)=>b.rel-a.rel);
+      for(const {r,rel} of list){const safeRel=Math.max(-10,rel),p=this.project(safeRel,r.lanePos);this.drawCar(c,r,p.x,p.y,p.scale*.94,false,p.laneW,this.vehicleHeading(safeRel,r));}
+      const p=this.project(0,this.local.lanePos);this.drawCar(c,this.local,p.x,p.y,1.04,true,p.laneW,this.vehicleHeading(0,this.local));
     }
 
-    drawCar(c,r,x,y,s,isLocal,laneW){
-      const im=this.images.cars[r.color%this.images.cars.length];
-      const width=Math.min(clamp(62*s,18,isLocal?92:88),laneW*.60);const ratio=im.height/im.width;
-      const carH=width*ratio;const blink=performance.now()<r.invincibleUntil&&Math.floor(performance.now()/110)%2===0;
-      c.save();
-      // Bóng tiếp xúc nằm ngay dưới bánh xe để xe có cảm giác bám mặt đường.
-      c.globalAlpha=.26;c.fillStyle='#07120f';c.beginPath();c.ellipse(x,y-2,width*.43,Math.max(3,width*.12),0,0,Math.PI*2);c.fill();
-      c.globalAlpha=blink?.3:1;c.shadowColor=isLocal?'rgba(255,210,80,.72)':'rgba(0,0,0,.22)';c.shadowBlur=isLocal?15:6;
-      c.drawImage(im,x-width/2,y-carH,width,carH);c.shadowBlur=0;
-      const avSize=clamp(22*s,9,30);const av=this.images.avatars[(r.avatar-1)%this.images.avatars.length];c.fillStyle='rgba(255,255,255,.94)';c.beginPath();c.arc(x,y-carH*.72,avSize*.55,0,Math.PI*2);c.fill();try{c.drawImage(av,x-avSize/2,y-carH*.72-avSize/2,avSize,avSize);}catch{}
-      c.font=`800 ${clamp(10*s,8,14)}px sans-serif`;c.textAlign='center';c.fillStyle='#fff';c.strokeStyle='rgba(0,0,0,.72)';c.lineWidth=3;c.strokeText(r.name,x,y+13*s);c.fillText(r.name,x,y+13*s);c.restore();
+    drawCar(c,r,x,y,s,isLocal,laneW,angle=0){
+      const metrics=this.carMetrics(r,s,isLocal,laneW,angle),im=metrics.frame.image;
+      const width=metrics.width,height=metrics.height;const blink=performance.now()<r.invincibleUntil&&Math.floor(performance.now()/105)%2===0;
+      c.save();c.translate(x,y);c.rotate(metrics.residual);
+      c.globalAlpha=.30;c.fillStyle='#07120f';c.beginPath();c.ellipse(0,-2,width*.39,Math.max(3,width*.11),0,0,Math.PI*2);c.fill();
+      c.globalAlpha=blink?.28:1;c.shadowColor=isLocal?'rgba(255,210,80,.74)':'rgba(0,0,0,.24)';c.shadowBlur=isLocal?16:6;
+      c.drawImage(im,-width/2,-height,width,height);c.shadowBlur=0;
+      const avSize=clamp(21*s,7,29),av=this.images.avatars[(r.avatar-1)%this.images.avatars.length];
+      c.fillStyle='rgba(255,255,255,.95)';c.beginPath();c.arc(0,-height*.66,avSize*.55,0,Math.PI*2);c.fill();try{c.drawImage(av,-avSize/2,-height*.66-avSize/2,avSize,avSize);}catch{}
+      c.restore();
+      c.save();c.font=`800 ${clamp(10*s,8,14)}px sans-serif`;c.textAlign='center';c.fillStyle='#fff';c.strokeStyle='rgba(0,0,0,.72)';c.lineWidth=3;c.strokeText(r.name,x,y+14*s);c.fillText(r.name,x,y+14*s);c.restore();
     }
 
-    drawSpeedLines(c){if(this.local.speed<118)return;const strength=clamp((this.local.speed-118)/45,0,1);c.strokeStyle=`rgba(255,255,255,${.15+.35*strength})`;c.lineWidth=2;for(let i=0;i<18;i++){const x=(i*83+this.local.distance*5)%this.width,y=(i*59+this.local.distance*7)%this.height;c.beginPath();c.moveTo(x,y);c.lineTo(x+(x-this.width/2)*.08,y+30+50*strength);c.stroke();}}
+    drawSpeedLines(c){
+      if(this.local.speed<112)return;const strength=clamp((this.local.speed-112)/90,0,1);
+      c.strokeStyle=`rgba(255,255,255,${.10+.32*strength})`;c.lineWidth=2;
+      for(let i=0;i<16;i++){const x=(i*109+this.local.distance*7.2)%this.width,y=(i*67+this.local.distance*10.5)%this.height;c.beginPath();c.moveTo(x,y);c.lineTo(x+(x-this.width/2)*.07,y+26+58*strength);c.stroke();}
+    }
   }
 
   window.HighwayGame=HighwayGame;
